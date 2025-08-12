@@ -6,6 +6,31 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
+// TEMP: one-time seeding endpoint (remove after use)
+import { exec } from "child_process";
+
+const SEED_TOKEN = process.env.SEED_TOKEN;
+let seedingHasRun = false;
+
+app.get("/__seed", (_req, res) => {
+  const token = (typeof _req.query.token === "string") ? _req.query.token : "";
+  if (!SEED_TOKEN || token !== SEED_TOKEN) {
+    return res.status(403).send("Forbidden");
+  }
+  if (seedingHasRun) return res.send("Seed already executed this boot.");
+
+  exec("npx prisma db seed", { env: process.env }, (err, stdout, stderr) => {
+    if (err) {
+      console.error("Seed error:", err, stderr);
+      return res.status(500).send("Seed failed. Check logs.");
+    }
+    console.log(stdout || "Seed completed.");
+    seedingHasRun = true;
+    return res.send("Seed done.");
+  });
+});
+
+
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;
