@@ -14,7 +14,7 @@ export const brokers = pgTable("brokers", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   name: text("name").notNull(),
   website: text("website").notNull(),
-  tier: integer("tier").notNull().default(5), // 1-5, 1 = flagship
+  
   isActive: boolean("is_active").notNull().default(true),
   scrapingPath: jsonb("scraping_path").notNull(), // JSON configuration for scraping
   lastScrapedAt: timestamp("last_scraped_at"),
@@ -138,3 +138,4 @@ export type InsertPainPoint = z.infer<typeof insertPainPointSchema>;
 // Status enums for validation
 export const ListingStatus = z.enum(["NEW", "CONTACTED", "RESPONDED", "QUALIFIED", "CLOSED"]);
 export const ScrapingStatus = z.enum(["running", "completed", "failed"]);
+
