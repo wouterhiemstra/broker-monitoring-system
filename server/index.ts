@@ -10,6 +10,23 @@ app.use(express.urlencoded({ extended: false }));
 // Simple health check (helps uptime + quick sanity)
 app.get("/health", (_req, res) => res.status(200).send("ok")); // ⬅️ NEW
 
+import { db } from "./db";
+import { brokers as brokersTable } from "../shared/schema";
+
+app.get("/api/debug/brokers-count", async (_req, res) => {
+  try {
+    const rows = await db.select().from(brokersTable);
+    res.json({ count: rows.length });
+  } catch (e:any) {
+    res.status(500).json({ error: "db_error", detail: String(e?.message || e) });
+  }
+});
+
+app.get("/api/debug/env", (_req, res) => {
+  res.json({ hasDatabaseUrl: Boolean(process.env.DATABASE_URL) });
+});
+
+
 // Mount brokers API so /api/brokers works
 app.use("/api/brokers", brokersRouter); // ⬅️ NEW
 
