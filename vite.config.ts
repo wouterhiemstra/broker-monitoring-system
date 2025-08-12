@@ -5,17 +5,18 @@ import react from "@vitejs/plugin-react";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(async ({ mode }) => {
   const isDev = mode === "development";
   const plugins = [react()];
 
   if (isDev) {
     try {
-      // @ts-ignore
-      plugins.push((await import("@replit/vite-plugin-cartographer")).default());
-      // @ts-ignore
-      plugins.push((await import("@replit/vite-plugin-runtime-error-modal")).default());
-    } catch {}
+      const cartographer = (await import("@replit/vite-plugin-cartographer")).default;
+      const errorModal = (await import("@replit/vite-plugin-runtime-error-modal")).default;
+      plugins.push(cartographer(), errorModal());
+    } catch {
+      // ignore if plugins not installed in prod
+    }
   }
 
   return {
