@@ -1,11 +1,11 @@
 import { Router } from "express";
 import { db } from "../db";
 import { brokers } from "../../shared/schema";
-import puppeteer from "puppeteer";
+import puppeteer, { executablePath } from "puppeteer";
 
 const router = Router();
 
-// Quick connectivity test (no browser): GET /api/scan/ping
+// GET /api/scan/ping — quick network check (no browser)
 router.get("/ping", async (_req, res) => {
   try {
     const rows = await db.select().from(brokers);
@@ -25,19 +25,24 @@ router.get("/ping", async (_req, res) => {
   }
 });
 
-// Real scan with Puppeteer: POST /api/scan
+// (Optional) GET /api/scan — friendly hint for browser GETs
+router.get("/", (_req, res) => {
+  res.json({ ok: true, hint: "Use POST /api/scan to start the real scan" });
+});
+
+// POST /api/scan — real scan with Puppeteer
 router.post("/", async (_req, res) => {
-  const results: Array<{ name: string; ok: boolean; title?: string; error?: string }> = [];
   let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
+  const results: Array<{ name: string; ok: boolean; title?: string; error?: string }> = [];
 
   try {
     const rows = await db.select().from(brokers);
     if (!rows.length) return res.status(400).json({ ok: false, error: "no_brokers" });
 
-    // Render needs these flags
     browser = await puppeteer.launch({
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      executablePath: executablePath(), // <-- use Chrome we install at build
     });
 
     const page = await browser.newPage();
@@ -48,11 +53,12 @@ router.post("/", async (_req, res) => {
         await page.goto(b.website, { waitUntil: "domcontentloaded" });
         const title = await page.title();
         results.push({ name: b.name, ok: true, title });
-        // TODO: read b.scrapingPath (array of steps) and click/apply filters here
+        // TODO: parse b.scrapingPath (array of steps) and click filters
       } catch (e: any) {
         results.push({ name: b.name, ok: false, error: String(e?.message || e) });
       }
     }
+
     res.json({ ok: true, results });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
