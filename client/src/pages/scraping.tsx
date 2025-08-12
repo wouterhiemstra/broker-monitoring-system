@@ -136,7 +136,7 @@ export default function Scraping() {
           <Button 
             variant="outline"
             onClick={() => startScrapingMutation.mutate()}
-            disabled={startScrapingMutation.isPending || scrapingStatus?.isRunning}
+            disabled={startScrapingMutation.isPending || (scrapingStatus?.isRunning ?? false)}
           >
             <Play className="w-4 h-4 mr-2" />
             Start All Brokers
@@ -206,7 +206,7 @@ export default function Scraping() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All Brokers</SelectItem>
-                {brokers.map((broker: any) => (
+                {(brokers as any[]).map((broker: any) => (
                   <SelectItem key={broker.id} value={broker.id}>
                     {broker.name}
                   </SelectItem>

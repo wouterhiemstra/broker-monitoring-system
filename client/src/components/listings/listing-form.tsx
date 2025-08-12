@@ -310,7 +310,7 @@ export function ListingForm({ onSuccess }: ListingFormProps) {
                   <FormItem>
                     <FormLabel>Contact Person</FormLabel>
                     <FormControl>
-                      <Input placeholder="Name..." {...field} />
+                      <Input placeholder="Name..." {...field} value={field.value || ""} />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -328,7 +328,8 @@ export function ListingForm({ onSuccess }: ListingFormProps) {
                     <Textarea 
                       placeholder="Additional notes (max 140 characters)..." 
                       maxLength={140}
-                      {...field} 
+                      {...field}
+                      value={field.value || ""}
                     />
                   </FormControl>
                   <FormMessage />

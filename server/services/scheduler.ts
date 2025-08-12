@@ -1,4 +1,4 @@
-import cron from "node-cron";
+import * as cron from "node-cron";
 import { scraperService } from "./scraper";
 import { storage } from "../storage";
 

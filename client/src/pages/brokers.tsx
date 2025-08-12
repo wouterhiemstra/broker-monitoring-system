@@ -201,7 +201,7 @@ export default function Brokers() {
       {brokers.length === 0 && (
         <Card className="border border-gray-200 shadow-sm">
           <CardContent className="flex flex-col items-center justify-center py-12">
-            <Users className="w-12 h-12 text-gray-400 mb-4" />
+            <Settings className="w-12 h-12 text-gray-400 mb-4" />
             <h3 className="text-lg font-medium text-gray-900 mb-2">No brokers configured</h3>
             <p className="text-sm text-gray-500 text-center mb-4">
               Get started by adding your first broker configuration
