@@ -7,6 +7,10 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
+import scanRouter from "./routes/scan";
+app.use("/api/scan", scanRouter);
+
+
 // Simple health check (helps uptime + quick sanity)
 app.get("/health", (_req, res) => res.status(200).send("ok")); // ⬅️ NEW
 
