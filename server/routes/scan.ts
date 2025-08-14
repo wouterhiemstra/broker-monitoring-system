@@ -1,6 +1,6 @@
+// server/routes/scan.ts
 import { Router } from "express";
 import puppeteer from "puppeteer";
-import { access } from "fs/promises";
 import sgMail from "@sendgrid/mail";
 import nodemailer from "nodemailer";
 import { eq } from "drizzle-orm";
@@ -10,7 +10,7 @@ import { createDealForListing } from "../integrations/hubspot";
 
 const router = Router();
 
-/* ---------------- Email setup (optional) ---------------- */
+/* ---------------- Optional email setup ---------------- */
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
 if (SENDGRID_KEY) sgMail.setApiKey(SENDGRID_KEY);
 
@@ -36,63 +36,112 @@ async function sendEmail(opts: { to: string; from: string; subject: string; html
   await transporter.sendMail(opts);
 }
 
-/* ---------------- Chrome path resolver (robust) ---------------- */
-async function resolveChromePath(): Promise<string | undefined> {
-  const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
-  if (envPath) {
-    try {
-      await access(envPath);
-      console.log("[scan] using PUPPETEER_EXECUTABLE_PATH:", envPath);
-      return envPath;
-    } catch {
-      console.warn("[scan] env PUPPETEER_EXECUTABLE_PATH not found on disk, falling back");
-    }
-  }
-  try {
-    const auto = await puppeteer.executablePath();
-    if (auto) {
-      console.log("[scan] using puppeteer.executablePath():", auto);
-      return auto;
-    }
-  } catch (e) {
-    console.warn("[scan] puppeteer.executablePath() failed, will launch without explicit path");
-  }
-  return undefined; // let Puppeteer decide
-}
-
 /* ---------------- Helpers ---------------- */
 const clean = (s?: string | null) => (s ?? "").replace(/\s+/g, " ").trim();
 const toAbs = (base: string, href?: string | null) => {
   try { return href ? new URL(href, base).toString() : null; } catch { return null; }
 };
 
+type Action =
+  | { click: string; waitFor?: string }                                  // click by CSS
+  | { clickText: string; within?: string; waitFor?: string }             // click by visible text
+  | { select: { selector: string; value?: string; text?: string }; waitFor?: string } // dropdown
+  | { scrollUntilText: string; maxScrolls?: number }                     // keep scrolling until text appears
+  | { type: "sleep"; ms: number }
+  | { waitFor: string };
+
 type ScrapeCfg =
   | {
-      list: string;
-      link?: string;
-      title?: string;
-      price?: string;
-      location?: string;
-      actions?: Array<{ click?: string; waitFor?: string } | { type: "sleep"; ms: number }>;
-      include?: string;
-      exclude?: string;
+      list: string;           // selector for each listing card/row
+      link?: string;          // selector inside card to get <a>
+      title?: string;         // selector for title text
+      price?: string;         // selector for price text
+      location?: string;      // selector for location text
+      actions?: Action[];     // pre-steps to apply filters, open tabs, etc.
+      include?: string;       // regex string to keep
+      exclude?: string;       // regex string to drop
     }
-  | string[]
+  | string[]                  // legacy: [listSelector, linkSelector?]
   | undefined;
+
+/* ---- action helpers ---- */
+async function clickAndMaybeNavigate(page: puppeteer.Page, fn: () => Promise<void>) {
+  const nav = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => null);
+  await fn();
+  await Promise.race([nav, page.waitForTimeout(400)]);
+}
 
 async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
   const obj = (cfg && !Array.isArray(cfg)) ? (cfg as any) : null;
-  const actions: any[] = obj?.actions || [];
+  const actions: Action[] = obj?.actions || [];
   for (const a of actions) {
-    if ((a as any).click) {
-      await page.click((a as any).click);
-      if ((a as any).waitFor) await page.waitForSelector((a as any).waitFor, { timeout: 15000 });
-    } else if ((a as any).type === "sleep" && (a as any).ms) {
-      await new Promise(r => setTimeout(r, (a as any).ms));
+    // click by CSS
+    if ("click" in a) {
+      await page.waitForSelector(a.click, { timeout: 15000 });
+      await clickAndMaybeNavigate(page, () => page.click(a.click));
+      if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
+      continue;
+    }
+    // click by visible text
+    if ("clickText" in a) {
+      const text = a.clickText.trim();
+      const xpath = a.within
+        ? `//${a.within}[contains(normalize-space(.), ${JSON.stringify(text)})]`
+        : `//*[contains(normalize-space(.), ${JSON.stringify(text)})]`;
+      const els = await page.$x(xpath);
+      if (els.length === 0) throw new Error(`clickText not found: ${text}`);
+      await clickAndMaybeNavigate(page, () => (els[0] as any).click());
+      if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
+      continue;
+    }
+    // select dropdown
+    if ("select" in a) {
+      const { selector, value, text } = a.select;
+      await page.waitForSelector(selector, { timeout: 15000 });
+      if (value) {
+        await page.select(selector, value);
+      } else if (text) {
+        await page.$eval(selector, (el, t) => {
+          const sel = el as HTMLSelectElement;
+          const opt = Array.from(sel.options).find(o => o.text.trim() === String(t).trim());
+          if (!opt) throw new Error(`select text not found: ${t}`);
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+        }, text);
+      } else {
+        throw new Error("select: provide value or text");
+      }
+      if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
+      continue;
+    }
+    // scroll until specific visible text appears
+    if ("scrollUntilText" in a) {
+      const target = String(a.scrollUntilText).trim();
+      const max = Number(a.maxScrolls ?? 20);
+      let found = false;
+      for (let i = 0; i < max; i++) {
+        const els = await page.$x(`//*[contains(normalize-space(.), ${JSON.stringify(target)})]`);
+        if (els.length > 0) { found = true; break; }
+        await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.9));
+        await page.waitForTimeout(600);
+      }
+      if (!found) console.warn(`[actions] scrollUntilText: "${target}" not found after ${max} scrolls`);
+      continue;
+    }
+    // wait for selector
+    if ("waitFor" in a) {
+      await page.waitForSelector(a.waitFor, { timeout: 15000 });
+      continue;
+    }
+    // sleep
+    if ((a as any).type === "sleep") {
+      await page.waitForTimeout((a as any).ms);
+      continue;
     }
   }
 }
 
+/* ---- extraction ---- */
 async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
   const out: Array<{ url: string; title: string; price?: string; location?: string }> = [];
 
@@ -159,22 +208,19 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
   return out.filter(r => (r.url && !seen.has(r.url) && seen.add(r.url)));
 }
 
-/* ---------------- Debug helpers ---------------- */
+/* ---- Debug: which Chrome path puppeteer sees ---- */
 router.get("/which-chrome", async (_req, res) => {
   try {
-    const envPath = process.env.PUPPETEER_EXECUTABLE_PATH || null;
     let auto: string | null = null;
     try { auto = await puppeteer.executablePath(); } catch { auto = null; }
-    res.json({ ok: true, envPath, autoPath: auto });
+    res.json({ ok: true, envPath: process.env.PUPPETEER_EXECUTABLE_PATH || null, autoPath: auto });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/* ---------------- Simple GET helpers ---------------- */
-router.get("/", (_req, res) => {
-  res.json({ ok: true, hint: "Use POST /api/scan to start the real scan" });
-});
+/* ---- Simple helpers ---- */
+router.get("/", (_req, res) => res.json({ ok: true, hint: "Use POST /api/scan to start the real scan" }));
 
 router.get("/ping", async (_req, res) => {
   try {
@@ -189,7 +235,7 @@ router.get("/ping", async (_req, res) => {
   }
 });
 
-/* ---------------- Main scan ---------------- */
+/* ---- Main scan ---- */
 router.post("/", async (_req, res) => {
   let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
   const toNotify: Array<{ id: string; broker: string; url: string; title: string; price?: string; location?: string }> = [];
@@ -199,10 +245,8 @@ router.post("/", async (_req, res) => {
     const active = await db.select().from(brokers).where(eq(brokers.isActive as any, true));
     if (!active.length) return res.status(400).json({ ok: false, error: "no_brokers" });
 
-    const exePath = await resolveChromePath();
-
-    // NOTE: we only set executablePath if we actually resolved one.
-    const launchOpts: Parameters<typeof puppeteer.launch>[0] = {
+    // No executablePath: let Puppeteer use the Chrome installed in your project cache
+    browser = await puppeteer.launch({
       headless: true,
       args: [
         "--no-sandbox",
@@ -213,10 +257,7 @@ router.post("/", async (_req, res) => {
         "--single-process",
       ],
       timeout: 120_000,
-    };
-    if (exePath) (launchOpts as any).executablePath = exePath;
-
-    browser = await puppeteer.launch(launchOpts);
+    });
 
     const page = await browser.newPage();
     page.setDefaultTimeout(60_000);
@@ -230,6 +271,7 @@ router.post("/", async (_req, res) => {
         await runActions(page, cfg);
         let items = await extract(page, b.website, cfg);
 
+        // Include/exclude regex filters (optional)
         if (cfg && !Array.isArray(cfg) && typeof cfg === "object") {
           const inc = (cfg as any).include ? new RegExp((cfg as any).include) : null;
           const exc = (cfg as any).exclude ? new RegExp((cfg as any).exclude) : null;
@@ -268,7 +310,7 @@ router.post("/", async (_req, res) => {
               url: it.url,
               title: it.title || it.url,
               price: it.price,
-              location: it.location
+              location: it.location,
             });
           } else {
             const notifiedAt = (existing[0] as any).notifiedAt ?? (existing[0] as any).notified_at;
@@ -279,7 +321,7 @@ router.post("/", async (_req, res) => {
                 url: it.url,
                 title: it.title || it.url,
                 price: it.price,
-                location: it.location
+                location: it.location,
               });
             }
           }
@@ -289,6 +331,7 @@ router.post("/", async (_req, res) => {
       }
     }
 
+    // Push new listings to HubSpot
     for (const n of toNotify) {
       await createDealForListing({
         title: n.title,
@@ -300,6 +343,7 @@ router.post("/", async (_req, res) => {
       });
     }
 
+    // Optional summary email
     if (toNotify.length > 0) {
       const html = toNotify.map(l =>
         `<p><strong>${l.broker}</strong> — ${clean(l.title)}${l.price ? ` · <em>${clean(l.price)}</em>` : ""}${l.location ? ` · ${clean(l.location)}` : ""}<br/><a href="${l.url}">${l.url}</a></p>`
@@ -313,6 +357,7 @@ router.post("/", async (_req, res) => {
       });
     }
 
+    // Mark as notified
     for (const n of toNotify) {
       await db.update(listings)
         .set({ [(listings as any).notifiedAt ? "notifiedAt" : "notified_at"]: new Date() } as any)
