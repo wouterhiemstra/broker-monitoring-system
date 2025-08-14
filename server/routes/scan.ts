@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { db } from "../db";
 import { brokers } from "../../shared/schema";
-import puppeteer, { executablePath } from "puppeteer";
+import puppeteer from "puppeteer";
 
 const router = Router();
 
@@ -25,7 +25,7 @@ router.get("/ping", async (_req, res) => {
   }
 });
 
-// (Optional) GET /api/scan — friendly hint for browser GETs
+// Friendly GET message
 router.get("/", (_req, res) => {
   res.json({ ok: true, hint: "Use POST /api/scan to start the real scan" });
 });
@@ -39,10 +39,22 @@ router.post("/", async (_req, res) => {
     const rows = await db.select().from(brokers);
     if (!rows.length) return res.status(400).json({ ok: false, error: "no_brokers" });
 
+    // Get Chrome path from environment or Puppeteer default
+    const exePath =
+      process.env.PUPPETEER_EXECUTABLE_PATH || (await puppeteer.executablePath());
+
     browser = await puppeteer.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-      executablePath: executablePath(), // <-- use Chrome we install at build
+      executablePath: exePath,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+        "--single-process"
+      ],
+      timeout: 120_000
     });
 
     const page = await browser.newPage();
@@ -53,7 +65,6 @@ router.post("/", async (_req, res) => {
         await page.goto(b.website, { waitUntil: "domcontentloaded" });
         const title = await page.title();
         results.push({ name: b.name, ok: true, title });
-        // TODO: parse b.scrapingPath (array of steps) and click filters
       } catch (e: any) {
         results.push({ name: b.name, ok: false, error: String(e?.message || e) });
       }
