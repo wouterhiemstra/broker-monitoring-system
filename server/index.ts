@@ -8,39 +8,39 @@ import { brokers as brokersTable } from "../shared/schema";
 
 const app = express();
 
-// --- TEMP DEBUG: quick endpoints & simple logger ---
+/* ---------- Quick health + basic logger ---------- */
 app.get("/ping", (_req, res) => {
   console.log("PING route hit");
   res.send("pong");
 });
-
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.use((req, _res, next) => {
-  // log every request so we can SEE /api/scan being hit
   console.log("Request:", req.method, req.url);
   next();
 });
-// --- /TEMP DEBUG ---
+/* ------------------------------------------------- */
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// ---------- SCAN ROUTES ----------
-/** sanity endpoint to confirm the scan router path is reachable */
+/* ---------- SCAN ROUTES ---------- */
+// sanity
 app.get("/api/scan/ping", (_req, res) => res.json({ ok: true, msg: "scan route alive" }));
 
-/** helper: start a scan from the browser by forwarding to POST /api/scan */
+// browser helper -> forwards to POST /api/scan (supports ?only=rightbiz)
 app.get("/api/scan/now", (req, res, next) => {
-  (req as any).method = "POST";   // force POST
-  (req as any).url = "/";         // hit scanRouter's root
+  (req as any).method = "POST";
+  (req as any).url = "/";
+  (req as any).body = {};
+  if (req.query.only) (req as any).body.only = String(req.query.only);
   (scanRouter as any).handle(req, res, next);
 });
 
 app.use("/api/scan", scanRouter);
-// ---------- /SCAN ROUTES ----------
+/* ---------- /SCAN ROUTES ---------- */
 
-// Debug helpers
+/* ---------- Debug helpers ---------- */
 app.get("/api/debug/brokers-count", async (_req, res) => {
   try {
     const rows = await db.select().from(brokersTable);
@@ -53,11 +53,13 @@ app.get("/api/debug/brokers-count", async (_req, res) => {
 app.get("/api/debug/env", (_req, res) => {
   res.json({ hasDatabaseUrl: Boolean(process.env.DATABASE_URL) });
 });
+/* ---------------------------------- */
 
-// Mount brokers API
+/* ---------- Brokers API ---------- */
 app.use("/api/brokers", brokersRouter);
+/* --------------------------------- */
 
-// Response logger for /api/* (keeps your pretty logs)
+/* ---------- /api response logger ---------- */
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;
@@ -81,6 +83,7 @@ app.use((req, res, next) => {
 
   next();
 });
+/* ------------------------------------------ */
 
 (async () => {
   // Register any other routes your app has
