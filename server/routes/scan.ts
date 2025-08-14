@@ -1,11 +1,12 @@
 import { Router } from "express";
 import puppeteer from "puppeteer";
+import { access } from "fs/promises";
 import sgMail from "@sendgrid/mail";
 import nodemailer from "nodemailer";
+import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { brokers, listings } from "../../shared/schema";
 import { createDealForListing } from "../integrations/hubspot";
-import { eq } from "drizzle-orm"; // ✅ Added
 
 const router = Router();
 
@@ -35,6 +36,17 @@ async function sendEmail(opts: { to: string; from: string; subject: string; html
   await transporter.sendMail(opts);
 }
 
+/* ---------------- Robust Chrome resolver ---------------- */
+async function getChromePath() {
+  const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (envPath) {
+    try { await access(envPath); return envPath; } catch { /* fall through to auto */ }
+  }
+  // Let Puppeteer tell us where Chrome actually is (installed during postinstall)
+  const auto = await puppeteer.executablePath();
+  return auto;
+}
+
 /* ---------------- Helpers ---------------- */
 const clean = (s?: string | null) => (s ?? "").replace(/\s+/g, " ").trim();
 const toAbs = (base: string, href?: string | null) => {
@@ -43,33 +55,34 @@ const toAbs = (base: string, href?: string | null) => {
 
 type ScrapeCfg =
   | {
-      list: string;
-      link?: string;
-      title?: string;
-      price?: string;
-      location?: string;
+      list: string;           // selector for each listing card/row
+      link?: string;          // selector inside card to get <a>
+      title?: string;         // selector for title text
+      price?: string;         // selector for price text
+      location?: string;      // selector for location text
       actions?: Array<{ click?: string; waitFor?: string } | { type: "sleep"; ms: number }>;
-      include?: string;
-      exclude?: string;
+      include?: string;       // regex string to keep matches
+      exclude?: string;       // regex string to drop matches
     }
-  | string[]
+  | string[]                 // legacy: [listSelector, linkSelector?]
   | undefined;
 
 async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
   const obj = (cfg && !Array.isArray(cfg)) ? (cfg as any) : null;
   const actions: any[] = obj?.actions || [];
   for (const a of actions) {
-    if (a.click) {
-      await page.click(a.click);
-      if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
-    } else if (a.type === "sleep" && a.ms) {
-      await new Promise(r => setTimeout(r, a.ms));
+    if ((a as any).click) {
+      await page.click((a as any).click);
+      if ((a as any).waitFor) await page.waitForSelector((a as any).waitFor, { timeout: 15000 });
+    } else if ((a as any).type === "sleep" && (a as any).ms) {
+      await new Promise(r => setTimeout(r, (a as any).ms));
     }
   }
 }
 
 async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
   const out: Array<{ url: string; title: string; price?: string; location?: string }> = [];
+
   if (Array.isArray(cfg)) {
     const [listSel, linkSel] = cfg;
     if (listSel) {
@@ -89,8 +102,8 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
         if (url) out.push({ url, title: clean((it as any).title) || url });
       }
     }
-  } else if (cfg && typeof cfg === "object" && cfg.list) {
-    const { list, link, title, price, location } = cfg;
+  } else if (cfg && typeof cfg === "object" && (cfg as any).list) {
+    const { list, link, title, price, location } = cfg as any;
     const items = await page.$$eval(
       list,
       (els, sels) => {
@@ -127,6 +140,7 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
       });
     }
   } else {
+    // Fallback: all anchors (rare)
     const anchors = await page.$$eval("a[href]", (els) =>
       els.map((a) => ({
         href: (a as HTMLAnchorElement).getAttribute("href") || "",
@@ -138,10 +152,13 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
       if (url) out.push({ url, title: clean((a as any).title) || url });
     }
   }
+
+  // Dedupe by URL
   const seen = new Set<string>();
   return out.filter(r => (r.url && !seen.has(r.url) && seen.add(r.url)));
 }
 
+/* ---------------- Simple GET helpers ---------------- */
 router.get("/", (_req, res) => {
   res.json({ ok: true, hint: "Use POST /api/scan to start the real scan" });
 });
@@ -159,20 +176,29 @@ router.get("/ping", async (_req, res) => {
   }
 });
 
+/* ---------------- Main scan ---------------- */
 router.post("/", async (_req, res) => {
   let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
-  const toNotify: any[] = [];
+  const toNotify: Array<{ id: string; broker: string; url: string; title: string; price?: string; location?: string }> = [];
   const foundCountByBroker: Record<string, number> = {};
 
   try {
-    const rows = await db.select().from(brokers).where(eq(brokers.isActive, true)); // ✅ FIXED
-    if (!rows.length) return res.status(400).json({ ok: false, error: "no_brokers" });
+    const active = await db.select().from(brokers).where(eq(brokers.isActive as any, true));
+    if (!active.length) return res.status(400).json({ ok: false, error: "no_brokers" });
 
-    const exePath = process.env.PUPPETEER_EXECUTABLE_PATH || (await puppeteer.executablePath());
+    const exePath = await getChromePath();
+
     browser = await puppeteer.launch({
       headless: true,
       executablePath: exePath,
-      args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu","--no-zygote","--single-process"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+        "--single-process"
+      ],
       timeout: 120_000
     });
 
@@ -180,7 +206,7 @@ router.post("/", async (_req, res) => {
     page.setDefaultTimeout(60_000);
     page.setDefaultNavigationTimeout(60_000);
 
-    for (const b of rows) {
+    for (const b of active) {
       try {
         await page.goto(b.website, { waitUntil: "domcontentloaded" });
 
@@ -188,9 +214,10 @@ router.post("/", async (_req, res) => {
         await runActions(page, cfg);
         let items = await extract(page, b.website, cfg);
 
+        // Optional include/exclude filters
         if (cfg && !Array.isArray(cfg) && typeof cfg === "object") {
-          const inc = cfg.include ? new RegExp(cfg.include) : null;
-          const exc = cfg.exclude ? new RegExp(cfg.exclude) : null;
+          const inc = (cfg as any).include ? new RegExp((cfg as any).include) : null;
+          const exc = (cfg as any).exclude ? new RegExp((cfg as any).exclude) : null;
           items = items.filter(({ url, title }) => {
             const hay = `${title} ${url}`;
             if (inc && !inc.test(hay)) return false;
@@ -202,17 +229,18 @@ router.post("/", async (_req, res) => {
         foundCountByBroker[b.name] = items.length;
 
         for (const it of items) {
+          // Check if listing already exists (by website/url)
           const existing = await db
             .select({ id: listings.id, notifiedAt: (listings as any).notifiedAt ?? (listings as any).notified_at })
             .from(listings)
-            .where(eq(listings.website as any, it.url)) // ✅ FIXED
+            .where(eq((listings as any).website, it.url))
             .limit(1);
 
           if (existing.length === 0) {
             const inserted = await db
               .insert(listings)
               .values({
-                brokerId: b.id,
+                brokerId: (b as any).id,
                 title: it.title || it.url,
                 website: it.url,
                 price: it.price || null,
@@ -220,11 +248,25 @@ router.post("/", async (_req, res) => {
               } as any)
               .returning({ id: listings.id });
 
-            toNotify.push({ id: inserted[0].id, broker: b.name, url: it.url, title: it.title || it.url, price: it.price, location: it.location });
+            toNotify.push({
+              id: inserted[0].id,
+              broker: b.name,
+              url: it.url,
+              title: it.title || it.url,
+              price: it.price,
+              location: it.location
+            });
           } else {
             const notifiedAt = (existing[0] as any).notifiedAt ?? (existing[0] as any).notified_at;
             if (!notifiedAt) {
-              toNotify.push({ id: existing[0].id as any, broker: b.name, url: it.url, title: it.title || it.url, price: it.price, location: it.location });
+              toNotify.push({
+                id: (existing[0] as any).id,
+                broker: b.name,
+                url: it.url,
+                title: it.title || it.url,
+                price: it.price,
+                location: it.location
+              });
             }
           }
         }
@@ -233,6 +275,7 @@ router.post("/", async (_req, res) => {
       }
     }
 
+    /* ---- HubSpot: create a Deal for each new listing ---- */
     for (const n of toNotify) {
       await createDealForListing({
         title: n.title,
@@ -244,6 +287,7 @@ router.post("/", async (_req, res) => {
       });
     }
 
+    /* ---- Optional email summary (skipped if no creds) ---- */
     if (toNotify.length > 0) {
       const html = toNotify.map(l =>
         `<p><strong>${l.broker}</strong> — ${clean(l.title)}${l.price ? ` · <em>${clean(l.price)}</em>` : ""}${l.location ? ` · ${clean(l.location)}` : ""}<br/><a href="${l.url}">${l.url}</a></p>`
@@ -257,15 +301,16 @@ router.post("/", async (_req, res) => {
       });
     }
 
+    // Mark as notified so we don't double-notify / double-push to HubSpot
     for (const n of toNotify) {
       await db.update(listings)
         .set({ [(listings as any).notifiedAt ? "notifiedAt" : "notified_at"]: new Date() } as any)
-        .where(eq(listings.id as any, n.id as any)); // ✅ FIXED
+        .where(eq(listings.id as any, n.id as any));
     }
 
     res.json({
       ok: true,
-      scannedBrokers: rows.length,
+      scannedBrokers: active.length,
       foundCounts: foundCountByBroker,
       notifiedCount: toNotify.length,
       preview: toNotify.slice(0, 3),
