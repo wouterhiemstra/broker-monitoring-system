@@ -36,15 +36,28 @@ async function sendEmail(opts: { to: string; from: string; subject: string; html
   await transporter.sendMail(opts);
 }
 
-/* ---------------- Robust Chrome resolver ---------------- */
-async function getChromePath() {
+/* ---------------- Chrome path resolver (robust) ---------------- */
+async function resolveChromePath(): Promise<string | undefined> {
   const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
   if (envPath) {
-    try { await access(envPath); return envPath; } catch { /* fall through to auto */ }
+    try {
+      await access(envPath);
+      console.log("[scan] using PUPPETEER_EXECUTABLE_PATH:", envPath);
+      return envPath;
+    } catch {
+      console.warn("[scan] env PUPPETEER_EXECUTABLE_PATH not found on disk, falling back");
+    }
   }
-  // Let Puppeteer tell us where Chrome actually is (installed during postinstall)
-  const auto = await puppeteer.executablePath();
-  return auto;
+  try {
+    const auto = await puppeteer.executablePath();
+    if (auto) {
+      console.log("[scan] using puppeteer.executablePath():", auto);
+      return auto;
+    }
+  } catch (e) {
+    console.warn("[scan] puppeteer.executablePath() failed, will launch without explicit path");
+  }
+  return undefined; // let Puppeteer decide
 }
 
 /* ---------------- Helpers ---------------- */
@@ -55,16 +68,16 @@ const toAbs = (base: string, href?: string | null) => {
 
 type ScrapeCfg =
   | {
-      list: string;           // selector for each listing card/row
-      link?: string;          // selector inside card to get <a>
-      title?: string;         // selector for title text
-      price?: string;         // selector for price text
-      location?: string;      // selector for location text
+      list: string;
+      link?: string;
+      title?: string;
+      price?: string;
+      location?: string;
       actions?: Array<{ click?: string; waitFor?: string } | { type: "sleep"; ms: number }>;
-      include?: string;       // regex string to keep matches
-      exclude?: string;       // regex string to drop matches
+      include?: string;
+      exclude?: string;
     }
-  | string[]                 // legacy: [listSelector, linkSelector?]
+  | string[]
   | undefined;
 
 async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
@@ -139,24 +152,24 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
         location: clean((it as any).location),
       });
     }
-  } else {
-    // Fallback: all anchors (rare)
-    const anchors = await page.$$eval("a[href]", (els) =>
-      els.map((a) => ({
-        href: (a as HTMLAnchorElement).getAttribute("href") || "",
-        title: (a.textContent || "").replace(/\s+/g, " ").trim(),
-      }))
-    );
-    for (const a of anchors) {
-      const url = toAbs(baseUrl, (a as any).href);
-      if (url) out.push({ url, title: clean((a as any).title) || url });
-    }
   }
 
   // Dedupe by URL
   const seen = new Set<string>();
   return out.filter(r => (r.url && !seen.has(r.url) && seen.add(r.url)));
 }
+
+/* ---------------- Debug helpers ---------------- */
+router.get("/which-chrome", async (_req, res) => {
+  try {
+    const envPath = process.env.PUPPETEER_EXECUTABLE_PATH || null;
+    let auto: string | null = null;
+    try { auto = await puppeteer.executablePath(); } catch { auto = null; }
+    res.json({ ok: true, envPath, autoPath: auto });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
 /* ---------------- Simple GET helpers ---------------- */
 router.get("/", (_req, res) => {
@@ -186,21 +199,24 @@ router.post("/", async (_req, res) => {
     const active = await db.select().from(brokers).where(eq(brokers.isActive as any, true));
     if (!active.length) return res.status(400).json({ ok: false, error: "no_brokers" });
 
-    const exePath = await getChromePath();
+    const exePath = await resolveChromePath();
 
-    browser = await puppeteer.launch({
+    // NOTE: we only set executablePath if we actually resolved one.
+    const launchOpts: Parameters<typeof puppeteer.launch>[0] = {
       headless: true,
-      executablePath: exePath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--no-zygote",
-        "--single-process"
+        "--single-process",
       ],
-      timeout: 120_000
-    });
+      timeout: 120_000,
+    };
+    if (exePath) (launchOpts as any).executablePath = exePath;
+
+    browser = await puppeteer.launch(launchOpts);
 
     const page = await browser.newPage();
     page.setDefaultTimeout(60_000);
@@ -214,7 +230,6 @@ router.post("/", async (_req, res) => {
         await runActions(page, cfg);
         let items = await extract(page, b.website, cfg);
 
-        // Optional include/exclude filters
         if (cfg && !Array.isArray(cfg) && typeof cfg === "object") {
           const inc = (cfg as any).include ? new RegExp((cfg as any).include) : null;
           const exc = (cfg as any).exclude ? new RegExp((cfg as any).exclude) : null;
@@ -229,7 +244,6 @@ router.post("/", async (_req, res) => {
         foundCountByBroker[b.name] = items.length;
 
         for (const it of items) {
-          // Check if listing already exists (by website/url)
           const existing = await db
             .select({ id: listings.id, notifiedAt: (listings as any).notifiedAt ?? (listings as any).notified_at })
             .from(listings)
@@ -275,7 +289,6 @@ router.post("/", async (_req, res) => {
       }
     }
 
-    /* ---- HubSpot: create a Deal for each new listing ---- */
     for (const n of toNotify) {
       await createDealForListing({
         title: n.title,
@@ -287,7 +300,6 @@ router.post("/", async (_req, res) => {
       });
     }
 
-    /* ---- Optional email summary (skipped if no creds) ---- */
     if (toNotify.length > 0) {
       const html = toNotify.map(l =>
         `<p><strong>${l.broker}</strong> — ${clean(l.title)}${l.price ? ` · <em>${clean(l.price)}</em>` : ""}${l.location ? ` · ${clean(l.location)}` : ""}<br/><a href="${l.url}">${l.url}</a></p>`
@@ -301,7 +313,6 @@ router.post("/", async (_req, res) => {
       });
     }
 
-    // Mark as notified so we don't double-notify / double-push to HubSpot
     for (const n of toNotify) {
       await db.update(listings)
         .set({ [(listings as any).notifiedAt ? "notifiedAt" : "notified_at"]: new Date() } as any)
