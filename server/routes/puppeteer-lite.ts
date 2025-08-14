@@ -20,7 +20,7 @@ export async function slimPage(page: import("puppeteer").Page) {
   await page.setRequestInterception(true);
   page.on("request", (req) => {
     const t = req.resourceType();
-    if (t === "image" || t === "media" || t === "font") return req.abort();
+    if (t === "image" || t === "media" || t === "font" || t === "stylesheet") return req.abort();
     req.continue();
   });
 }

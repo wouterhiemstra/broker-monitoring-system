@@ -1,11 +1,13 @@
 // server/routes/scan.ts
 import { Router, type Request, type Response } from "express";
+import { eq } from "drizzle-orm";
 import puppeteer from "puppeteer";
 import sgMail from "@sendgrid/mail";
 import nodemailer from "nodemailer";
 import { db } from "../db";
 import { brokers, listings } from "../../shared/schema";
 import { createDealForListing } from "../integrations/hubspot";
+import { launchBrowser, slimPage } from "./puppeteer-lite";
 
 const router = Router();
 
@@ -14,60 +16,53 @@ const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
 if (SENDGRID_KEY) sgMail.setApiKey(SENDGRID_KEY);
 
 async function sendEmail(opts: { to: string; from: string; subject: string; html: string }) {
-  if (SENDGRID_KEY) {
-    await sgMail.send(opts);
-    return;
-  }
+  if (SENDGRID_KEY) { await sgMail.send(opts); return; }
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
-  if (!host || !user || !pass) {
-    console.log(`[email skipped] ${opts.subject}`);
-    return;
-  }
-  const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass },
-  });
+  if (!host || !user || !pass) { console.log(`[email skipped] ${opts.subject}`); return; }
+  const transporter = nodemailer.createTransport({ host, port, secure: port === 465, auth: { user, pass } });
   await transporter.sendMail(opts);
 }
 
 /* ========== Utils ========== */
 const clean = (s?: string | null) => (s ?? "").replace(/\s+/g, " ").trim();
-const toAbs = (base: string, href?: string | null) => {
-  try { return href ? new URL(href, base).toString() : null; } catch { return null; }
-};
+const toAbs = (base: string, href?: string | null) => { try { return href ? new URL(href, base).toString() : null; } catch { return null; } };
 
 type Action =
-  | { click: string; waitFor?: string }
-  | { clickText: string; within?: string; waitFor?: string }
+  | { click: string; waitFor?: string }                               // CSS click
+  | { clickText: string; within?: string; waitFor?: string }          // visible text click (no XPath)
   | { select: { selector: string; value?: string; text?: string }; waitFor?: string }
   | { scrollUntilText: string; maxScrolls?: number }
   | { type: "sleep"; ms: number }
   | { waitFor: string };
 
 type ScrapeCfg =
-  | {
-      actions?: Action[];
-      include?: string;
-      exclude?: string;
-      list?: string;
-      link?: string;
-      title?: string;
-      price?: string;
-      location?: string;
-    }
+  | { actions?: Action[]; include?: string; exclude?: string; list?: string; link?: string; title?: string; price?: string; location?: string; }
   | string[]
   | undefined;
 
-/* ========== Actions ========== */
+/* ========== Action helpers (NO $x) ========== */
 async function clickAndMaybeNavigate(page: puppeteer.Page, fn: () => Promise<void>) {
   const nav = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => null);
   await fn();
   await Promise.race([nav, page.waitForTimeout(300)]);
+}
+
+async function clickByText(page: puppeteer.Page, text: string, within?: string) {
+  const needle = text.trim().toLowerCase();
+  const rootSel = within || "body";
+  const ok = await page.evaluate((t, root) => {
+    const container = document.querySelector(root) || document.body;
+    const nodes = container.querySelectorAll("button,a,[role='button'],li,div,span,label,input");
+    for (const el of Array.from(nodes) as HTMLElement[]) {
+      const txt = (el.innerText || (el as any).value || el.textContent || "").trim().toLowerCase();
+      if (txt && txt.includes(t)) { el.click(); return true; }
+    }
+    return false;
+  }, needle, rootSel);
+  if (!ok) throw new Error(`clickText not found: ${text}`);
 }
 
 async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
@@ -81,14 +76,7 @@ async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
       continue;
     }
     if ("clickText" in a) {
-      const text = a.clickText.trim();
-      const within = (a as any).within;
-      const xpath = within
-        ? `//${within}[contains(normalize-space(.), ${JSON.stringify(text)})]`
-        : `//*[contains(normalize-space(.), ${JSON.stringify(text)})]`;
-      const els = await page.$x(xpath);
-      if (els.length === 0) throw new Error(`clickText not found: ${text}`);
-      await clickAndMaybeNavigate(page, () => (els[0] as any).click());
+      await clickAndMaybeNavigate(page, () => clickByText(page, a.clickText, (a as any).within));
       if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
       continue;
     }
@@ -101,34 +89,34 @@ async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
           const sel = el as HTMLSelectElement;
           const opt = Array.from(sel.options).find(o => o.text.trim() === String(t).trim());
           if (!opt) throw new Error(`select text not found: ${t}`);
-          sel.value = opt.value;
-          sel.dispatchEvent(new Event("change", { bubbles: true }));
+          sel.value = opt.value; sel.dispatchEvent(new Event("change", { bubbles: true }));
         }, text);
       } else throw new Error("select: provide value or text");
       if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
       continue;
     }
     if ("scrollUntilText" in a) {
-      const target = String(a.scrollUntilText).trim();
+      const target = String(a.scrollUntilText).toLowerCase().trim();
       const max = Number(a.maxScrolls ?? 20);
       let found = false;
       for (let i = 0; i < max; i++) {
-        const els = await page.$x(`//*[contains(normalize-space(.), ${JSON.stringify(target)})]`);
-        if (els.length > 0) { found = true; break; }
+        const seen = await page.evaluate((t) => {
+          const all = document.querySelectorAll("body *");
+          for (const el of Array.from(all) as HTMLElement[]) {
+            const txt = (el.innerText || el.textContent || "").trim().toLowerCase();
+            if (txt && txt.includes(t)) return true;
+          }
+          return false;
+        }, target);
+        if (seen) { found = true; break; }
         await page.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 0.9)));
         await page.waitForTimeout(600);
       }
-      if (!found) console.warn(`[actions] scrollUntilText: "${target}" not found after ${max} scrolls`);
+      if (!found) console.warn(`[actions] scrollUntilText: "${a.scrollUntilText}" not found after ${max} scrolls`);
       continue;
     }
-    if ("waitFor" in a) {
-      await page.waitForSelector(a.waitFor, { timeout: 15000 });
-      continue;
-    }
-    if ((a as any).type === "sleep") {
-      await page.waitForTimeout((a as any).ms);
-      continue;
-    }
+    if ("waitFor" in a) { await page.waitForSelector(a.waitFor, { timeout: 15000 }); continue; }
+    if ((a as any).type === "sleep") { await page.waitForTimeout((a as any).ms); continue; }
   }
 }
 
@@ -192,12 +180,7 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
       );
       for (const it of items) {
         const url = toAbs(baseUrl, (it as any).href);
-        if (url) out.push({
-          url,
-          title: clean((it as any).title) || url,
-          price: clean((it as any).price),
-          location: clean((it as any).location),
-        });
+        if (url) out.push({ url, title: clean((it as any).title) || url, price: clean((it as any).price), location: clean((it as any).location) });
       }
     } else {
       const items = await page.$$eval(
@@ -227,42 +210,23 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
   return out.filter(r => (r.url && !seen.has(r.url) && seen.add(r.url)));
 }
 
-/* ========== Debug routes ========== */
-router.get("/", (_req, res) =>
-  res.json({ ok: true, hint: "POST /api/scan  (optionally body: { only: 'rightbiz' })" })
-);
+/* ========== Info route ========== */
+router.get("/", (_req, res) => res.json({ ok: true, hint: "POST /api/scan  (body: { only: 'rightbiz' } optional)" }));
 
 /* ========== Main scan ========== */
 router.post("/", async (req: Request, res: Response) => {
   const toNotify: Array<{ id: any; broker: string; url: string; title: string; price?: string; location?: string }> = [];
   const foundCountByBroker: Record<string, number> = {};
 
-  // pick brokers (filter by body.only if provided)
   const allBrokers = await db.select().from(brokers);
   const only = typeof req.body?.only === "string" ? req.body.only.toLowerCase().trim() : "";
   const targets = only
     ? allBrokers.filter(b => (b as any).name?.toLowerCase() === only)
     : allBrokers.filter(b => ((b as any).is_active ?? (b as any).isActive ?? true) === true);
 
-  if (targets.length === 0) {
-    return res.status(400).json({ ok: false, error: only ? `no_broker_named_${only}` : "no_brokers" });
-  }
+  if (targets.length === 0) return res.status(400).json({ ok: false, error: only ? `no_broker_named_${only}` : "no_brokers" });
 
-  // launch browser (low RAM)
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--no-zygote",
-      "--single-process",
-      "--disable-gpu",
-      "--no-first-run"
-    ],
-    defaultViewport: { width: 1280, height: 800 },
-    timeout: 120_000
-  });
+  const browser = await launchBrowser();
 
   try {
     for (const b of targets) {
@@ -270,21 +234,12 @@ router.post("/", async (req: Request, res: Response) => {
       const baseUrl: string = (b as any).website || "";
       const cfg: ScrapeCfg = (b as any).scrapingPath ?? (b as any).scraping_path;
 
-      if (!baseUrl) {
-        foundCountByBroker[brokerName] = 0;
-        continue;
-      }
+      if (!baseUrl) { foundCountByBroker[brokerName] = 0; continue; }
 
       const page = await browser.newPage();
 
       try {
-        // block heavy assets
-        await page.setRequestInterception(true);
-        page.on("request", (req) => {
-          const t = req.resourceType();
-          if (t === "image" || t === "media" || t === "font" || t === "stylesheet") return req.abort();
-          req.continue();
-        });
+        await slimPage(page);
         page.setDefaultTimeout(60_000);
         page.setDefaultNavigationTimeout(60_000);
 
@@ -292,7 +247,6 @@ router.post("/", async (req: Request, res: Response) => {
         await runActions(page, cfg);
         let items = await extract(page, baseUrl, cfg);
 
-        // include/exclude regex
         if (cfg && !Array.isArray(cfg) && typeof cfg === "object") {
           const inc = (cfg as any).include ? new RegExp((cfg as any).include) : null;
           const exc = (cfg as any).exclude ? new RegExp((cfg as any).exclude) : null;
@@ -306,45 +260,25 @@ router.post("/", async (req: Request, res: Response) => {
 
         foundCountByBroker[brokerName] = items.length;
 
-        // dynamic columns
-        const linkCol = (listings as any).link ?? (listings as any).website;
-        const brokerIdCol = (listings as any).broker_id ?? (listings as any).brokerId;
-        const notifiedAtCol = (listings as any).notified_at ?? (listings as any).notifiedAt;
-
         for (const it of items) {
-          // dup check by link
           const existing = await db
-            .select({ id: listings.id, notifiedAt: notifiedAtCol })
+            .select({ id: listings.id, notifiedAt: listings.notified_at })
             .from(listings)
-            .where((linkCol ? (linkCol as any) : (listings as any).link).eq
-              ? (linkCol as any).eq(it.url)
-              : (db as any).select) // fallback if type inference acts up
-            .where(linkCol as any, "=", it.url) // drizzle adaptor guard
-            .limit(1)
-            .catch(async () => {
-              // fallback: use eq() helper if available
-              const { eq } = await import("drizzle-orm");
-              return db.select({ id: listings.id, notifiedAt: notifiedAtCol })
-                .from(listings)
-                .where(eq(linkCol as any, it.url))
-                .limit(1);
-            });
+            .where(eq(listings.link, it.url))
+            .limit(1);
 
-          const isNew = !Array.isArray(existing) || existing.length === 0;
-          if (isNew) {
-            const insertVals: any = {
-              title: it.title || it.url,
-              price: it.price || null,
-              location: it.location || null,
-            };
-            // assign link
-            if ((linkCol as any)?.name) insertVals[(linkCol as any).name] = it.url;
-            else insertVals["link"] = it.url;
-            if ((b as any).id && brokerIdCol) {
-              insertVals[(brokerIdCol as any).name ?? "broker_id"] = (b as any).id;
-            }
+          if (existing.length === 0) {
+            const inserted = await db
+              .insert(listings)
+              .values({
+                broker_id: (b as any).id,
+                title: it.title || it.url,
+                link: it.url,
+                price: it.price || null,
+                location: it.location || null,
+              } as any)
+              .returning({ id: listings.id });
 
-            const inserted = await db.insert(listings).values(insertVals).returning({ id: listings.id });
             toNotify.push({
               id: inserted[0].id,
               broker: brokerName,
@@ -374,7 +308,7 @@ router.post("/", async (req: Request, res: Response) => {
       }
     }
 
-    // HubSpot
+    // HubSpot push
     for (const n of toNotify) {
       try {
         await createDealForListing({
@@ -391,31 +325,17 @@ router.post("/", async (req: Request, res: Response) => {
     }
 
     // mark notified
-    const notifiedAtCol = (listings as any).notified_at ?? (listings as any).notifiedAt;
-    if (notifiedAtCol) {
-      for (const n of toNotify) {
-        await db.update(listings)
-          .set({ [(notifiedAtCol as any).name ?? "notified_at"]: new Date() } as any)
-          .where((listings.id as any).eq ? (listings.id as any).eq(n.id) : (db as any).select)
-          .catch(async () => {
-            const { eq } = await import("drizzle-orm");
-            await db.update(listings).set({ [(notifiedAtCol as any).name ?? "notified_at"]: new Date() } as any)
-              .where(eq(listings.id as any, n.id as any));
-          });
-      }
+    for (const n of toNotify) {
+      await db.update(listings)
+        .set({ notified_at: new Date() } as any)
+        .where(eq(listings.id as any, n.id as any));
     }
 
-    res.json({
-      ok: true,
-      scannedBrokers: targets.length,
-      foundCounts: foundCountByBroker,
-      notifiedCount: toNotify.length,
-      preview: toNotify.slice(0, 3),
-    });
+    res.json({ ok: true, scannedBrokers: targets.length, foundCounts: foundCountByBroker, notifiedCount: toNotify.length, preview: toNotify.slice(0, 3) });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
-    try { await (await (puppeteer as any).browser?.())?.close?.(); } catch {}
+    try { await browser.close(); } catch {}
   }
 });
 
