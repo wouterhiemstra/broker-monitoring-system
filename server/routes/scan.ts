@@ -3,18 +3,13 @@ import { Router, type Request, type Response } from "express";
 import puppeteer from "puppeteer";
 import sgMail from "@sendgrid/mail";
 import nodemailer from "nodemailer";
-import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { brokers, listings } from "../../shared/schema";
 import { createDealForListing } from "../integrations/hubspot";
 
-// If you created this helper file next to scan.ts, use "./puppeteer-lite"
-// (Adjust path if you put it elsewhere.)
-import { launchBrowser, slimPage } from "./puppeteer-lite";
-
 const router = Router();
 
-/* ---------------- Email (optional) ---------------- */
+/* ========== Email (optional) ========== */
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY || "";
 if (SENDGRID_KEY) sgMail.setApiKey(SENDGRID_KEY);
 
@@ -40,15 +35,15 @@ async function sendEmail(opts: { to: string; from: string; subject: string; html
   await transporter.sendMail(opts);
 }
 
-/* ---------------- Utils ---------------- */
+/* ========== Utils ========== */
 const clean = (s?: string | null) => (s ?? "").replace(/\s+/g, " ").trim();
 const toAbs = (base: string, href?: string | null) => {
   try { return href ? new URL(href, base).toString() : null; } catch { return null; }
 };
 
 type Action =
-  | { click: string; waitFor?: string } // click by CSS
-  | { clickText: string; within?: string; waitFor?: string } // click by visible text
+  | { click: string; waitFor?: string }
+  | { clickText: string; within?: string; waitFor?: string }
   | { select: { selector: string; value?: string; text?: string }; waitFor?: string }
   | { scrollUntilText: string; maxScrolls?: number }
   | { type: "sleep"; ms: number }
@@ -56,7 +51,6 @@ type Action =
 
 type ScrapeCfg =
   | {
-      // optional actions + field selectors
       actions?: Action[];
       include?: string;
       exclude?: string;
@@ -66,10 +60,10 @@ type ScrapeCfg =
       price?: string;
       location?: string;
     }
-  | string[]            // legacy: [listSelector, linkSelector?]
+  | string[]
   | undefined;
 
-/* ---------------- Action runner ---------------- */
+/* ========== Actions ========== */
 async function clickAndMaybeNavigate(page: puppeteer.Page, fn: () => Promise<void>) {
   const nav = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => null);
   await fn();
@@ -80,14 +74,12 @@ async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
   const obj = (cfg && !Array.isArray(cfg)) ? (cfg as any) : null;
   const actions: Action[] = obj?.actions || [];
   for (const a of actions) {
-    // click by CSS
     if ("click" in a) {
       await page.waitForSelector(a.click, { timeout: 15000 });
       await clickAndMaybeNavigate(page, () => page.click(a.click));
       if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
       continue;
     }
-    // click by visible text (XPath)
     if ("clickText" in a) {
       const text = a.clickText.trim();
       const within = (a as any).within;
@@ -100,13 +92,11 @@ async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
       if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
       continue;
     }
-    // select dropdown
     if ("select" in a) {
       const { selector, value, text } = a.select;
       await page.waitForSelector(selector, { timeout: 15000 });
-      if (value) {
-        await page.select(selector, value);
-      } else if (text) {
+      if (value) await page.select(selector, value);
+      else if (text) {
         await page.$eval(selector, (el, t) => {
           const sel = el as HTMLSelectElement;
           const opt = Array.from(sel.options).find(o => o.text.trim() === String(t).trim());
@@ -114,13 +104,10 @@ async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
           sel.value = opt.value;
           sel.dispatchEvent(new Event("change", { bubbles: true }));
         }, text);
-      } else {
-        throw new Error("select: provide value or text");
-      }
+      } else throw new Error("select: provide value or text");
       if (a.waitFor) await page.waitForSelector(a.waitFor, { timeout: 15000 });
       continue;
     }
-    // scroll until text appears
     if ("scrollUntilText" in a) {
       const target = String(a.scrollUntilText).trim();
       const max = Number(a.maxScrolls ?? 20);
@@ -134,12 +121,10 @@ async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
       if (!found) console.warn(`[actions] scrollUntilText: "${target}" not found after ${max} scrolls`);
       continue;
     }
-    // wait for selector
     if ("waitFor" in a) {
       await page.waitForSelector(a.waitFor, { timeout: 15000 });
       continue;
     }
-    // sleep
     if ((a as any).type === "sleep") {
       await page.waitForTimeout((a as any).ms);
       continue;
@@ -147,11 +132,10 @@ async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
   }
 }
 
-/* ---------------- Extraction ---------------- */
+/* ========== Extraction ========== */
 async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
   const out: Array<{ url: string; title: string; price?: string; location?: string }> = [];
 
-  // Legacy tuple style
   if (Array.isArray(cfg)) {
     const [listSel, linkSel] = cfg;
     if (listSel) {
@@ -206,7 +190,6 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
         },
         { linkSel, titleSel, priceSel, locSel }
       );
-
       for (const it of items) {
         const url = toAbs(baseUrl, (it as any).href);
         if (url) out.push({
@@ -217,7 +200,6 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
         });
       }
     } else {
-      // Fallback (no list selector provided): try common listing anchors
       const items = await page.$$eval(
         "article a[href], .listing a[href], li.result-item a[href], .result a[href], a.listing-title, h2 a",
         (links) => {
@@ -226,9 +208,7 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
             const href = a.getAttribute("href") || "";
             const text = (a.textContent || "").replace(/\s+/g, " ").trim();
             if (!href || text.length < 8) continue;
-            // ignore nav and hash links
             if (href.startsWith("#")) continue;
-            // basic filter to avoid site chrome
             const bad = ["login", "signup", "privacy", "terms", "contact", "cookie"];
             if (bad.some(b => href.toLowerCase().includes(b))) continue;
             res.push({ href, title: text });
@@ -236,7 +216,6 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
           return res;
         }
       );
-
       for (const it of items) {
         const url = toAbs(baseUrl, (it as any).href);
         if (url) out.push({ url, title: clean((it as any).title) || url });
@@ -244,57 +223,46 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
     }
   }
 
-  // Dedupe by URL
   const seen = new Set<string>();
   return out.filter(r => (r.url && !seen.has(r.url) && seen.add(r.url)));
 }
 
-/* ---------------- Debug helpers ---------------- */
-router.get("/which-chrome", async (_req, res) => {
-  try {
-    let auto: string | null = null;
-    try { auto = await puppeteer.executablePath(); } catch { auto = null; }
-    res.json({ ok: true, envPath: process.env.PUPPETEER_EXECUTABLE_PATH || null, autoPath: auto });
-  } catch (e: any) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
+/* ========== Debug routes ========== */
 router.get("/", (_req, res) =>
-  res.json({ ok: true, hint: "Use POST /api/scan with { only: 'rightbiz' } to run a scan." })
+  res.json({ ok: true, hint: "POST /api/scan  (optionally body: { only: 'rightbiz' })" })
 );
 
-router.get("/ping", async (_req, res) => {
-  try {
-    const rows = await db.select().from(brokers);
-    res.json({ ok: true, brokers: rows.length });
-  } catch (e: any) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-/* ---------------- Main scan ---------------- */
+/* ========== Main scan ========== */
 router.post("/", async (req: Request, res: Response) => {
   const toNotify: Array<{ id: any; broker: string; url: string; title: string; price?: string; location?: string }> = [];
   const foundCountByBroker: Record<string, number> = {};
 
-  // Choose active brokers (and filter by ?only)
-  const isActiveCol = (brokers as any).is_active ?? (brokers as any).isActive;
-  const active = isActiveCol
-    ? await db.select().from(brokers).where(eq(isActiveCol, true))
-    : await db.select().from(brokers);
-
+  // pick brokers (filter by body.only if provided)
+  const allBrokers = await db.select().from(brokers);
   const only = typeof req.body?.only === "string" ? req.body.only.toLowerCase().trim() : "";
   const targets = only
-    ? active.filter(b => (b as any).name?.toLowerCase() === only)
-    : active;
+    ? allBrokers.filter(b => (b as any).name?.toLowerCase() === only)
+    : allBrokers.filter(b => ((b as any).is_active ?? (b as any).isActive ?? true) === true);
 
   if (targets.length === 0) {
     return res.status(400).json({ ok: false, error: only ? `no_broker_named_${only}` : "no_brokers" });
   }
 
-  // Launch Chrome once; reuse for all brokers (incognito per broker)
-  const browser = await launchBrowser();
+  // launch browser (low RAM)
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--no-zygote",
+      "--single-process",
+      "--disable-gpu",
+      "--no-first-run"
+    ],
+    defaultViewport: { width: 1280, height: 800 },
+    timeout: 120_000
+  });
 
   try {
     for (const b of targets) {
@@ -303,28 +271,28 @@ router.post("/", async (req: Request, res: Response) => {
       const cfg: ScrapeCfg = (b as any).scrapingPath ?? (b as any).scraping_path;
 
       if (!baseUrl) {
-        console.warn(`[scan] ${brokerName}: missing website`);
         foundCountByBroker[brokerName] = 0;
         continue;
       }
 
-      const context = await browser.createIncognitoBrowserContext();
-      const page = await context.newPage();
+      const page = await browser.newPage();
 
       try {
-        // Make the page "light"
-        await slimPage(page);
+        // block heavy assets
+        await page.setRequestInterception(true);
+        page.on("request", (req) => {
+          const t = req.resourceType();
+          if (t === "image" || t === "media" || t === "font" || t === "stylesheet") return req.abort();
+          req.continue();
+        });
         page.setDefaultTimeout(60_000);
         page.setDefaultNavigationTimeout(60_000);
 
-        // Navigate + actions
         await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
         await runActions(page, cfg);
-
-        // Extract items
         let items = await extract(page, baseUrl, cfg);
 
-        // include/exclude (regex strings from cfg)
+        // include/exclude regex
         if (cfg && !Array.isArray(cfg) && typeof cfg === "object") {
           const inc = (cfg as any).include ? new RegExp((cfg as any).include) : null;
           const exc = (cfg as any).exclude ? new RegExp((cfg as any).exclude) : null;
@@ -338,7 +306,7 @@ router.post("/", async (req: Request, res: Response) => {
 
         foundCountByBroker[brokerName] = items.length;
 
-        // DB columns (handle snake_case or camelCase)
+        // dynamic columns
         const linkCol = (listings as any).link ?? (listings as any).website;
         const brokerIdCol = (listings as any).broker_id ?? (listings as any).brokerId;
         const notifiedAtCol = (listings as any).notified_at ?? (listings as any).notifiedAt;
@@ -348,23 +316,35 @@ router.post("/", async (req: Request, res: Response) => {
           const existing = await db
             .select({ id: listings.id, notifiedAt: notifiedAtCol })
             .from(listings)
-            .where(eq(linkCol, it.url))
-            .limit(1);
+            .where((linkCol ? (linkCol as any) : (listings as any).link).eq
+              ? (linkCol as any).eq(it.url)
+              : (db as any).select) // fallback if type inference acts up
+            .where(linkCol as any, "=", it.url) // drizzle adaptor guard
+            .limit(1)
+            .catch(async () => {
+              // fallback: use eq() helper if available
+              const { eq } = await import("drizzle-orm");
+              return db.select({ id: listings.id, notifiedAt: notifiedAtCol })
+                .from(listings)
+                .where(eq(linkCol as any, it.url))
+                .limit(1);
+            });
 
-          if (existing.length === 0) {
+          const isNew = !Array.isArray(existing) || existing.length === 0;
+          if (isNew) {
             const insertVals: any = {
               title: it.title || it.url,
               price: it.price || null,
               location: it.location || null,
             };
-            insertVals[linkCol.name ?? "link"] = it.url;
-            if (brokerIdCol) insertVals[brokerIdCol.name ?? "broker_id"] = (b as any).id;
+            // assign link
+            if ((linkCol as any)?.name) insertVals[(linkCol as any).name] = it.url;
+            else insertVals["link"] = it.url;
+            if ((b as any).id && brokerIdCol) {
+              insertVals[(brokerIdCol as any).name ?? "broker_id"] = (b as any).id;
+            }
 
-            const inserted = await db
-              .insert(listings)
-              .values(insertVals)
-              .returning({ id: listings.id });
-
+            const inserted = await db.insert(listings).values(insertVals).returning({ id: listings.id });
             toNotify.push({
               id: inserted[0].id,
               broker: brokerName,
@@ -374,7 +354,7 @@ router.post("/", async (req: Request, res: Response) => {
               location: it.location,
             });
           } else {
-            const notifiedAt = (existing[0] as any).notifiedAt ?? null;
+            const notifiedAt = (existing[0] as any)?.notifiedAt ?? null;
             if (!notifiedAt) {
               toNotify.push({
                 id: (existing[0] as any).id,
@@ -389,14 +369,12 @@ router.post("/", async (req: Request, res: Response) => {
         }
       } catch (e: any) {
         console.error(`Scan error for ${brokerName}:`, e?.message || e);
-        foundCountByBroker[brokerName] = foundCountByBroker[brokerName] ?? 0;
       } finally {
         try { await page.close(); } catch {}
-        try { await context.close(); } catch {}
       }
     }
 
-    // HubSpot push (only for new/unnotified)
+    // HubSpot
     for (const n of toNotify) {
       try {
         await createDealForListing({
@@ -412,13 +390,18 @@ router.post("/", async (req: Request, res: Response) => {
       }
     }
 
-    // Mark as notified
+    // mark notified
     const notifiedAtCol = (listings as any).notified_at ?? (listings as any).notifiedAt;
     if (notifiedAtCol) {
       for (const n of toNotify) {
         await db.update(listings)
-          .set({ [notifiedAtCol.name ?? "notified_at"]: new Date() } as any)
-          .where(eq(listings.id as any, n.id as any));
+          .set({ [(notifiedAtCol as any).name ?? "notified_at"]: new Date() } as any)
+          .where((listings.id as any).eq ? (listings.id as any).eq(n.id) : (db as any).select)
+          .catch(async () => {
+            const { eq } = await import("drizzle-orm");
+            await db.update(listings).set({ [(notifiedAtCol as any).name ?? "notified_at"]: new Date() } as any)
+              .where(eq(listings.id as any, n.id as any));
+          });
       }
     }
 
@@ -432,11 +415,7 @@ router.post("/", async (req: Request, res: Response) => {
   } catch (e: any) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
-    // Close browser (prevents OOM restarts)
-    try { const b = await puppeteer.browser?.(); } catch {}
-    // we launched via helper:
-    // @ts-ignore - launchBrowser returns a Browser
-    try { (await (browser as any))?.close?.(); } catch {}
+    try { await (await (puppeteer as any).browser?.())?.close?.(); } catch {}
   }
 });
 
