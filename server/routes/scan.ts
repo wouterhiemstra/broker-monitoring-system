@@ -5,6 +5,7 @@ import nodemailer from "nodemailer";
 import { db } from "../db";
 import { brokers, listings } from "../../shared/schema";
 import { createDealForListing } from "../integrations/hubspot";
+import { eq } from "drizzle-orm"; // ✅ Added
 
 const router = Router();
 
@@ -42,16 +43,16 @@ const toAbs = (base: string, href?: string | null) => {
 
 type ScrapeCfg =
   | {
-      list: string;           // selector for each listing card/row
-      link?: string;          // selector inside card to get <a>
-      title?: string;         // selector for title text
-      price?: string;         // selector for price text
-      location?: string;      // selector for location text
+      list: string;
+      link?: string;
+      title?: string;
+      price?: string;
+      location?: string;
       actions?: Array<{ click?: string; waitFor?: string } | { type: "sleep"; ms: number }>;
-      include?: string;       // regex string to keep matches
-      exclude?: string;       // regex string to drop matches
+      include?: string;
+      exclude?: string;
     }
-  | string[]                 // legacy: [listSelector, linkSelector?]
+  | string[]
   | undefined;
 
 async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
@@ -69,7 +70,6 @@ async function runActions(page: puppeteer.Page, cfg?: ScrapeCfg) {
 
 async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
   const out: Array<{ url: string; title: string; price?: string; location?: string }> = [];
-
   if (Array.isArray(cfg)) {
     const [listSel, linkSel] = cfg;
     if (listSel) {
@@ -127,7 +127,6 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
       });
     }
   } else {
-    // fallback: all anchors (rarely used)
     const anchors = await page.$$eval("a[href]", (els) =>
       els.map((a) => ({
         href: (a as HTMLAnchorElement).getAttribute("href") || "",
@@ -139,13 +138,10 @@ async function extract(page: puppeteer.Page, baseUrl: string, cfg?: ScrapeCfg) {
       if (url) out.push({ url, title: clean((a as any).title) || url });
     }
   }
-
-  // dedupe by URL
   const seen = new Set<string>();
   return out.filter(r => (r.url && !seen.has(r.url) && seen.add(r.url)));
 }
 
-/* ---------------- Simple GET helpers ---------------- */
 router.get("/", (_req, res) => {
   res.json({ ok: true, hint: "Use POST /api/scan to start the real scan" });
 });
@@ -163,14 +159,13 @@ router.get("/ping", async (_req, res) => {
   }
 });
 
-/* ---------------- Main scan ---------------- */
 router.post("/", async (_req, res) => {
   let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
-  const toNotify: Array<{ id: string; broker: string; url: string; title: string; price?: string; location?: string }> = [];
+  const toNotify: any[] = [];
   const foundCountByBroker: Record<string, number> = {};
 
   try {
-    const rows = await db.select().from(brokers).where(brokers.isActive.eq(true));
+    const rows = await db.select().from(brokers).where(eq(brokers.isActive, true)); // ✅ FIXED
     if (!rows.length) return res.status(400).json({ ok: false, error: "no_brokers" });
 
     const exePath = process.env.PUPPETEER_EXECUTABLE_PATH || (await puppeteer.executablePath());
@@ -193,7 +188,6 @@ router.post("/", async (_req, res) => {
         await runActions(page, cfg);
         let items = await extract(page, b.website, cfg);
 
-        // optional include/exclude filters
         if (cfg && !Array.isArray(cfg) && typeof cfg === "object") {
           const inc = cfg.include ? new RegExp(cfg.include) : null;
           const exc = cfg.exclude ? new RegExp(cfg.exclude) : null;
@@ -208,11 +202,10 @@ router.post("/", async (_req, res) => {
         foundCountByBroker[b.name] = items.length;
 
         for (const it of items) {
-          // Check if listing already exists (by website/url)
           const existing = await db
             .select({ id: listings.id, notifiedAt: (listings as any).notifiedAt ?? (listings as any).notified_at })
             .from(listings)
-            .where(((listings as any).website).eq(it.url))
+            .where(eq(listings.website as any, it.url)) // ✅ FIXED
             .limit(1);
 
           if (existing.length === 0) {
@@ -240,7 +233,6 @@ router.post("/", async (_req, res) => {
       }
     }
 
-    /* ---- HubSpot: create a Deal for each new listing ---- */
     for (const n of toNotify) {
       await createDealForListing({
         title: n.title,
@@ -252,7 +244,6 @@ router.post("/", async (_req, res) => {
       });
     }
 
-    /* ---- Optional email summary (skipped if no creds) ---- */
     if (toNotify.length > 0) {
       const html = toNotify.map(l =>
         `<p><strong>${l.broker}</strong> — ${clean(l.title)}${l.price ? ` · <em>${clean(l.price)}</em>` : ""}${l.location ? ` · ${clean(l.location)}` : ""}<br/><a href="${l.url}">${l.url}</a></p>`
@@ -266,11 +257,10 @@ router.post("/", async (_req, res) => {
       });
     }
 
-    // Mark as notified so we never double-notify / double-push to HubSpot
     for (const n of toNotify) {
       await db.update(listings)
         .set({ [(listings as any).notifiedAt ? "notifiedAt" : "notified_at"]: new Date() } as any)
-        .where(listings.id.eq(n.id as any));
+        .where(eq(listings.id as any, n.id as any)); // ✅ FIXED
     }
 
     res.json({
