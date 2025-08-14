@@ -8,7 +8,7 @@ import { brokers as brokersTable } from "../shared/schema";
 
 const app = express();
 
-/* ---------- Quick health + basic logger ---------- */
+/* ---------- Health + simple request logger ---------- */
 app.get("/ping", (_req, res) => {
   console.log("PING route hit");
   res.send("pong");
@@ -19,7 +19,7 @@ app.use((req, _res, next) => {
   console.log("Request:", req.method, req.url);
   next();
 });
-/* ------------------------------------------------- */
+/* --------------------------------------------------- */
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -28,13 +28,24 @@ app.use(express.urlencoded({ extended: false }));
 // sanity
 app.get("/api/scan/ping", (_req, res) => res.json({ ok: true, msg: "scan route alive" }));
 
-// browser helper -> forwards to POST /api/scan (supports ?only=rightbiz)
-app.get("/api/scan/now", (req, res, next) => {
-  (req as any).method = "POST";
-  (req as any).url = "/";
-  (req as any).body = {};
-  if (req.query.only) (req as any).body.only = String(req.query.only);
-  (scanRouter as any).handle(req, res, next);
+// browser helper -> performs a REAL HTTP POST to /api/scan (supports ?only=rightbiz)
+app.get("/api/scan/now", async (req, res) => {
+  try {
+    const base = `${req.protocol}://${req.get("host")}`;
+    const body: Record<string, string> = {};
+    if (req.query.only) body.only = String(req.query.only);
+
+    const r = await fetch(`${base}/api/scan`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const data = await r.json().catch(() => ({}));
+    res.status(r.status).json(data);
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
 app.use("/api/scan", scanRouter);
