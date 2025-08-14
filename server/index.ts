@@ -26,10 +26,19 @@ app.use((req, _res, next) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// Mount scan routes
-// sanity endpoint to confirm the scan router path is reachable
+// ---------- SCAN ROUTES ----------
+/** sanity endpoint to confirm the scan router path is reachable */
 app.get("/api/scan/ping", (_req, res) => res.json({ ok: true, msg: "scan route alive" }));
+
+/** helper: start a scan from the browser by forwarding to POST /api/scan */
+app.get("/api/scan/now", (req, res, next) => {
+  (req as any).method = "POST";   // force POST
+  (req as any).url = "/";         // hit scanRouter's root
+  (scanRouter as any).handle(req, res, next);
+});
+
 app.use("/api/scan", scanRouter);
+// ---------- /SCAN ROUTES ----------
 
 // Debug helpers
 app.get("/api/debug/brokers-count", async (_req, res) => {
